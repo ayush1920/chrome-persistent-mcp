@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "existing-chrome-playwright": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "args": ["-m", "playwright_full"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "BROWSER_MCP_CDP_PORT": "9222"
+      }
+    }
+  }
+}

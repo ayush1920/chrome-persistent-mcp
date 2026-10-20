@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "existing-chrome-mcp"
+version = "0.1.0"
+description = "Local MCP tools for an existing Chrome browser over CDP"
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = ["mcp", "model-context-protocol", "chrome", "cdp", "playwright", "browser-automation"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = ["mcp>=1.26,<2", "playwright>=1.58,<2"]
+
+[project.urls]
+Repository = "https://github.com/ayush1920/chrome-persistent-mcp"
+Issues = "https://github.com/ayush1920/chrome-persistent-mcp/issues"
+
+[project.scripts]
+existing-chrome-mcp = "browser_mcp:main"
+existing-chrome-playwright-mcp = "playwright_full:main"
+
+[tool.setuptools]
+py-modules = ["browser_mcp", "playwright_full"]

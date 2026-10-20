@@ -1,0 +1,9 @@
+{
+  "name": "existing-chrome-playwright-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Official Playwright MCP runtime for the Python CDP launcher",
+  "dependencies": {
+    "@playwright/mcp": "0.0.83"
+  }
+}
