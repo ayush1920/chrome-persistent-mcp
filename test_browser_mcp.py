@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,10 +15,103 @@ except ModuleNotFoundError:
     stdio_client = None  # type: ignore[misc,assignment]
 
 import browser_mcp
-from browser_mcp import AGENT_INSTRUCTIONS, BrowserHandler, public_url
+from browser_mcp import AGENT_INSTRUCTIONS, BrowserHandler, detect_agent_identity, public_url
 
 
 class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.state_file = Path(self.temp_dir.name) / "mcp_state.json"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _connected_handler(self, allow_actions: bool = True) -> BrowserHandler:
+        handler = BrowserHandler(allow_actions=allow_actions, state_file=self.state_file)
+        handler.browser = MagicMock()
+        handler.browser.is_connected.return_value = True
+        handler.active_ws_endpoint = "ws://127.0.0.1:9222/devtools/browser/persistent-123"
+        handler.connected_at_mono = 100.0
+        handler.connected_at_wall = 1700000000.0
+        return handler
+
+    async def test_deterministic_gate_blocks_tools_when_websocket_not_maintained(self):
+        """Tools must reject calls when the agent has not established a persistent WebSocket connection."""
+        handler = BrowserHandler(allow_actions=True, state_file=self.state_file)
+        with patch("browser_mcp.handler", handler):
+            for tool_call in [
+                lambda: browser_mcp.list_tabs(),
+                lambda: browser_mcp.select_tab("target-1"),
+                lambda: browser_mcp.inspect_page("target-1"),
+                lambda: browser_mcp.get_console_logs("target-1"),
+                lambda: browser_mcp.get_network_requests("target-1"),
+                lambda: browser_mcp.modify_dom("target-1", "#app", "set_text", "hi"),
+                lambda: browser_mcp.click("target-1", "button"),
+                lambda: browser_mcp.cdp_send("target-1", "DOM.getDocument"),
+            ]:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "trying to connect to MCP .* without maintaining a persistent WebSocket connection",
+                ):
+                    await tool_call()
+
+    async def test_agent_identification_and_live_uptime_tracking(self):
+        with patch.dict(os.environ, {"CLAUDE_CODE": "1"}, clear=False):
+            ident = detect_agent_identity()
+            self.assertEqual(ident["agent_id"], "claude-code")
+
+        explicit = detect_agent_identity("cursor-composer-agent")
+        self.assertEqual(explicit["agent_id"], "cursor-composer-agent")
+        self.assertEqual(explicit["detection_source"], "explicit_argument")
+
+        browser = MagicMock()
+        browser.is_connected.return_value = True
+        driver = MagicMock()
+        driver.chromium.connect_over_cdp = AsyncMock(return_value=browser)
+        driver.stop = AsyncMock()
+        factory = MagicMock()
+        factory.start = AsyncMock(return_value=driver)
+        handler = BrowserHandler(state_file=self.state_file)
+        ws_url = "ws://127.0.0.1:9222/devtools/browser/persistent-123"
+        with patch("browser_mcp.async_playwright", return_value=factory), patch.object(
+            handler, "websocket_endpoint", return_value=ws_url
+        ):
+            first = await handler.connect(prefer_websocket=True, agent_id="claude-code-session-1")
+            self.assertTrue(first["connected"])
+            self.assertEqual(first["agent"]["agent_id"], "claude-code-session-1")
+            self.assertGreaterEqual(first["connection_uptime_seconds"], 0.0)
+            self.assertIn("connection_uptime_human", first)
+            self.assertFalse(first["reused_existing_websocket"])
+
+            # Calling connect again while connected warns the agent and reuses the existing socket
+            second = await handler.connect(prefer_websocket=True, agent_id="claude-code-session-1")
+            self.assertTrue(second["reused_existing_websocket"])
+            self.assertEqual(second["redundant_connect_attempts"], 1)
+            self.assertIn("Persistent WebSocket is ALREADY active", second["warning"])
+
+        driver.chromium.connect_over_cdp.assert_awaited_once_with(ws_url, timeout=15000)
+        await handler.disconnect()
+
+    async def test_ephemeral_connection_churn_detected_across_handshakes(self):
+        browser = MagicMock()
+        browser.is_connected.return_value = True
+        driver = MagicMock()
+        driver.chromium.connect_over_cdp = AsyncMock(return_value=browser)
+        driver.stop = AsyncMock()
+        factory = MagicMock()
+        factory.start = AsyncMock(return_value=driver)
+        ws_url = "ws://127.0.0.1:9222/devtools/browser/persistent-123"
+
+        with patch("browser_mcp.async_playwright", return_value=factory):
+            for i in range(3):
+                h = BrowserHandler(state_file=self.state_file)
+                with patch.object(h, "websocket_endpoint", return_value=ws_url):
+                    res = await h.connect(prefer_websocket=True, agent_id="ephemeral-agent")
+                await h.disconnect()
+
+        self.assertEqual(res["recent_handshakes_last_60s"], 3)
+        self.assertIn("opened 3 separate CDP connections", res["ephemeral_connection_warning"])
+
     async def test_connect_attaches_to_9222_without_launching(self):
         browser = MagicMock()
         browser.is_connected.return_value = True
@@ -26,7 +120,7 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
         driver.stop = AsyncMock()
         factory = MagicMock()
         factory.start = AsyncMock(return_value=driver)
-        handler = BrowserHandler()
+        handler = BrowserHandler(state_file=self.state_file)
         with patch("browser_mcp.async_playwright", return_value=factory), patch.object(
             handler, "websocket_endpoint", return_value=None
         ):
@@ -45,26 +139,6 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
         driver.stop.assert_awaited_once()
         browser.close.assert_not_called()
 
-    async def test_connect_prefers_persistent_websocket_when_available(self):
-        browser = MagicMock()
-        browser.is_connected.return_value = True
-        driver = MagicMock()
-        driver.chromium.connect_over_cdp = AsyncMock(return_value=browser)
-        driver.stop = AsyncMock()
-        factory = MagicMock()
-        factory.start = AsyncMock(return_value=driver)
-        handler = BrowserHandler()
-        ws_url = "ws://127.0.0.1:9222/devtools/browser/persistent-123"
-        with patch("browser_mcp.async_playwright", return_value=factory), patch.object(
-            handler, "websocket_endpoint", return_value=ws_url
-        ):
-            status = await handler.connect(prefer_websocket=True)
-            self.assertTrue(status["connected"])
-            self.assertEqual(status["ws_endpoint"], ws_url)
-            self.assertEqual(status["transport"], "websocket")
-        driver.chromium.connect_over_cdp.assert_awaited_once_with(ws_url, timeout=15000)
-        await handler.disconnect()
-
     async def test_connect_uses_active_port_when_http_discovery_unavailable(self):
         browser = MagicMock()
         browser.is_connected.return_value = True
@@ -73,7 +147,7 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
         driver.stop = AsyncMock()
         factory = MagicMock()
         factory.start = AsyncMock(return_value=driver)
-        handler = BrowserHandler(devtools_active_port="DevToolsActivePort")
+        handler = BrowserHandler(devtools_active_port="DevToolsActivePort", state_file=self.state_file)
         with patch("browser_mcp.async_playwright", return_value=factory), patch(
             "browser_mcp.Path.read_text", return_value="9222\n/devtools/browser/test-browser\n"
         ):
@@ -85,7 +159,7 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
         await handler.disconnect()
 
     def test_active_port_never_changes_configured_port_or_host(self):
-        handler = BrowserHandler(devtools_active_port="DevToolsActivePort")
+        handler = BrowserHandler(devtools_active_port="DevToolsActivePort", state_file=self.state_file)
         for contents in ["9333\n/devtools/browser/test", "9222\nws://remote.example/test", "bad"]:
             with patch("browser_mcp.Path.read_text", return_value=contents):
                 self.assertIsNone(handler.websocket_endpoint())
@@ -96,7 +170,7 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
         driver.stop = AsyncMock()
         factory = MagicMock()
         factory.start = AsyncMock(return_value=driver)
-        handler = BrowserHandler()
+        handler = BrowserHandler(state_file=self.state_file)
         with patch("browser_mcp.async_playwright", return_value=factory), patch.object(
             handler, "websocket_endpoint", return_value=None
         ):
@@ -106,7 +180,7 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(handler.status()["connected"])
 
     async def test_tabs_cache_target_ids_without_repeated_cdp_probing(self):
-        handler = BrowserHandler()
+        handler = self._connected_handler()
         page = MagicMock()
         page.is_closed.return_value = False
         page.title = AsyncMock(return_value="Example")
@@ -118,13 +192,10 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
         context = MagicMock()
         context.pages = [page]
         context.new_cdp_session = AsyncMock(return_value=session)
-        handler.browser = MagicMock()
         handler.browser.contexts = [context]
-        handler.connect = AsyncMock()
         self.assertEqual(await handler.list_tabs(), [{
             "tab_id": "target-123", "title": "Example", "url": "https://example.com/path"
         }])
-        # Subsequent list_tabs() and page() calls reuse cached targetId and never open extra CDP sessions
         await handler.list_tabs()
         self.assertIs(await handler.page("target-123"), page)
         context.new_cdp_session.assert_awaited_once()
@@ -134,18 +205,15 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "Tab not found"):
             await handler.page("target-123")
 
-    async def test_disconnect_browser_keeps_websocket_alive_by_default_when_configured(self):
-        handler = BrowserHandler()
-        handler.browser = MagicMock()
-        handler.browser.is_connected.return_value = True
-        handler.active_ws_endpoint = "ws://127.0.0.1:9222/devtools/browser/persistent-123"
+    async def test_disconnect_browser_rejects_premature_close_and_keeps_websocket_alive(self):
+        handler = self._connected_handler()
         handler.disconnect = AsyncMock(return_value={"connected": False})
-        with patch("browser_mcp.handler", handler), patch.dict(
-            os.environ, {"BROWSER_MCP_KEEP_WEBSOCKET_ALIVE": "1"}
-        ):
+        with patch("browser_mcp.handler", handler):
             kept = await browser_mcp.disconnect_browser(force=False)
             self.assertTrue(kept["connected"])
             self.assertTrue(kept["kept_alive"])
+            self.assertTrue(kept["rejected_disconnect"])
+            self.assertIn("instead of maintaining a persistent WebSocket connection", kept["error"])
             handler.disconnect.assert_not_awaited()
 
             forced = await browser_mcp.disconnect_browser(force=True)
@@ -153,7 +221,7 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
             handler.disconnect.assert_awaited_once()
 
     async def test_console_and_network_telemetry_tools(self):
-        handler = BrowserHandler(allow_actions=True)
+        handler = self._connected_handler(allow_actions=True)
         page = MagicMock()
         handler.page = AsyncMock(return_value=page)
         telemetry = handler.get_telemetry("target-1")
@@ -173,9 +241,10 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
             frames = await browser_mcp.get_websocket_frames("target-1")
             self.assertEqual(frames["count"], 1)
             self.assertEqual(frames["frames"][0]["direction"], "received")
+            self.assertEqual(handler.tool_calls_count, 3)
 
     async def test_dom_manipulation_and_cdp_tools(self):
-        handler = BrowserHandler(allow_actions=True)
+        handler = self._connected_handler(allow_actions=True)
         page = MagicMock()
         page.evaluate = AsyncMock(return_value={"found": True, "tag": "div", "operation": "set_text"})
         handler.page = AsyncMock(return_value=page)
@@ -190,7 +259,7 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cdp_res["result"]["root"]["nodeId"], 1)
 
     async def test_actions_disabled_before_browser_access(self):
-        handler = BrowserHandler(allow_actions=False)
+        handler = self._connected_handler(allow_actions=False)
         handler.page = AsyncMock()
         with patch("browser_mcp.handler", handler):
             for action, arguments in [
@@ -207,7 +276,7 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
         handler.page.assert_not_awaited()
 
     async def test_password_fill_blocked(self):
-        handler = BrowserHandler(allow_actions=True)
+        handler = self._connected_handler(allow_actions=True)
         page = MagicMock()
         locator = MagicMock()
         locator.get_attribute = AsyncMock(return_value="password")
@@ -220,7 +289,7 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
         locator.fill.assert_not_awaited()
 
     async def test_invalid_navigation_blocked(self):
-        handler = BrowserHandler(allow_actions=True)
+        handler = self._connected_handler(allow_actions=True)
         handler.page = AsyncMock()
         with patch("browser_mcp.handler", handler):
             for url in ["javascript:alert(1)", "file:///etc/passwd", "https://user:secret@example.com"]:
@@ -233,8 +302,8 @@ class BrowserHandlerTests(unittest.IsolatedAsyncioTestCase):
             await browser_mcp.inspect_page("target", max_chars=50001)
 
     async def test_tool_registration_and_agent_instructions(self):
-        self.assertIn("SINGLE PERSISTENT WEBSOCKET CONNECTION", AGENT_INSTRUCTIONS)
-        self.assertIn("DO NOT PROBE PORT 9222 FROM THE TERMINAL", AGENT_INSTRUCTIONS)
+        self.assertIn("MANDATORY PERSISTENT WEBSOCKET CONNECTION", AGENT_INSTRUCTIONS)
+        self.assertIn("YOU CANNOT SKIP THE WEBSOCKET HANDSHAKE", AGENT_INSTRUCTIONS)
         tools = await browser_mcp.mcp.list_tools()
         tool_names = {tool.name for tool in tools}
         expected_core = {
@@ -270,7 +339,7 @@ class LiveMCPTests(unittest.IsolatedAsyncioTestCase):
                 await client.initialize()
                 tools = await client.list_tools()
                 self.assertGreaterEqual(len(tools.tools), 37)
-                connected = await client.call_tool("connect_browser", {"prefer_websocket": True})
+                connected = await client.call_tool("connect_websocket", {"agent_id": "live-test-agent"})
                 self.assertFalse(connected.isError)
                 self.assertTrue(json.loads(connected.content[0].text)["connected"])
                 await client.call_tool("disconnect_browser", {"force": True})
