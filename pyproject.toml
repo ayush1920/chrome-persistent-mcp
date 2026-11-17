@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "existing-chrome-mcp"
-version = "0.1.0"
-description = "Local MCP tools for an existing Chrome browser over CDP"
+version = "0.2.0"
+description = "Pure Python MCP server for an existing Chrome browser over a persistent WebSocket CDP connection with full Playwright tools"
 readme = "README.md"
 requires-python = ">=3.11"
-keywords = ["mcp", "model-context-protocol", "chrome", "cdp", "playwright", "browser-automation"]
+keywords = ["mcp", "model-context-protocol", "chrome", "cdp", "websocket", "playwright", "browser-automation"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -23,7 +23,6 @@ Issues = "https://github.com/ayush1920/chrome-persistent-mcp/issues"
 
 [project.scripts]
 existing-chrome-mcp = "browser_mcp:main"
-existing-chrome-playwright-mcp = "playwright_full:main"
 
 [tool.setuptools]
-py-modules = ["browser_mcp", "playwright_full"]
+py-modules = ["browser_mcp"]

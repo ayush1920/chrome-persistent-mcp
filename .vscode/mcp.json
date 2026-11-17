@@ -1,12 +1,14 @@
 {
   "servers": {
-    "existing-chrome-playwright": {
+    "existing-chrome-mcp": {
       "type": "stdio",
       "command": "${workspaceFolder}/.venv/Scripts/python.exe",
-      "args": ["-m", "playwright_full"],
+      "args": ["-m", "browser_mcp"],
       "cwd": "${workspaceFolder}",
       "env": {
-        "BROWSER_MCP_CDP_PORT": "9222"
+        "BROWSER_MCP_CDP_PORT": "9222",
+        "BROWSER_MCP_ALLOW_ACTIONS": "1",
+        "BROWSER_MCP_KEEP_WEBSOCKET_ALIVE": "1"
       }
     }
   }
